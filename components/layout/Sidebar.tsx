@@ -8,6 +8,7 @@ const menuItems = [
   { name: '新增活动', path: '/new-activity' },
   { name: '本期消耗情况', path: '/current-consumption' },
   { name: '活动复盘', path: '/retrospect' },
+  { name: 'Skill 下载', path: '/skill-download' },
 ];
 
 export default function Sidebar() {

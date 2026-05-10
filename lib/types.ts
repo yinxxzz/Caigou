@@ -61,7 +61,11 @@ export interface FinalSku {
   unitCost: number;
   suggestedPurchaseQuantity: number;
   finalPurchaseQuantity: number;
-  status: '可采购' | '无法采购' | '已替换' | '待确认';
+  currentWithPendingQuantity?: number;
+  activityStartEstimatedQuantity?: number;
+  juneEndingRemainingQuantity?: number;
+  realtimeInventoryQuantity?: number;
+  status: '采购' | '借调' | '备货' | '无需处理';
   remark?: string;
   sortOrder: number;
 }

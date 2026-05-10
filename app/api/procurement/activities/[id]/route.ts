@@ -3,11 +3,46 @@ import { db } from '@/lib/db';
 
 type DbRow = Record<string, unknown>;
 
+async function ensureProcurementInputColumns() {
+  const columns = [
+    ['current_consumption_summary', 'TEXT'],
+    ['pending_inbound_items_text', 'TEXT'],
+  ];
+
+  for (const [name, type] of columns) {
+    try {
+      await db.execute(`ALTER TABLE procurement_activities ADD COLUMN ${name} ${type}`);
+    } catch {
+      // Column already exists in initialized databases.
+    }
+  }
+}
+
+async function ensureFinalSkuColumns() {
+  const columns = [
+    ['package_name', 'TEXT'],
+    ['current_with_pending_quantity', 'INTEGER DEFAULT 0'],
+    ['activity_start_estimated_quantity', 'INTEGER DEFAULT 0'],
+    ['june_ending_remaining_quantity', 'INTEGER DEFAULT 0'],
+    ['realtime_inventory_quantity', 'INTEGER DEFAULT 0'],
+  ];
+
+  for (const [name, type] of columns) {
+    try {
+      await db.execute(`ALTER TABLE procurement_final_skus ADD COLUMN ${name} ${type}`);
+    } catch {
+      // Column already exists in initialized databases.
+    }
+  }
+}
+
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    await ensureProcurementInputColumns();
+    await ensureFinalSkuColumns();
     const { id } = await params;
 
     // 获取活动基本信息
@@ -49,6 +84,8 @@ export async function GET(
       orderForecastText: activityRow.order_forecast_text,
       purchaseAdviceText: activityRow.purchase_advice_text,
       riskSummary: activityRow.risk_summary,
+      currentConsumptionSummary: activityRow.current_consumption_summary,
+      pendingInboundItemsText: activityRow.pending_inbound_items_text,
       sourceActivityId: activityRow.source_activity_id,
       createdAt: activityRow.created_at,
       updatedAt: activityRow.updated_at,
@@ -84,6 +121,10 @@ export async function GET(
         unitCost: row.unit_cost,
         suggestedPurchaseQuantity: row.suggested_purchase_quantity,
         finalPurchaseQuantity: row.final_purchase_quantity,
+        currentWithPendingQuantity: row.current_with_pending_quantity,
+        activityStartEstimatedQuantity: row.activity_start_estimated_quantity,
+        juneEndingRemainingQuantity: row.june_ending_remaining_quantity,
+        realtimeInventoryQuantity: row.realtime_inventory_quantity,
         status: row.status,
         remark: row.remark,
         sortOrder: row.sort_order,

@@ -17,6 +17,10 @@ function mapSku(row: DbRow) {
     unitCost: row.unit_cost,
     suggestedPurchaseQuantity: row.suggested_purchase_quantity,
     finalPurchaseQuantity: row.final_purchase_quantity,
+    currentWithPendingQuantity: row.current_with_pending_quantity,
+    activityStartEstimatedQuantity: row.activity_start_estimated_quantity,
+    juneEndingRemainingQuantity: row.june_ending_remaining_quantity,
+    realtimeInventoryQuantity: row.realtime_inventory_quantity,
     status: row.status,
     remark: row.remark,
     sortOrder: row.sort_order,
@@ -24,10 +28,20 @@ function mapSku(row: DbRow) {
 }
 
 async function ensureFinalSkuColumns() {
-  try {
-    await db.execute('ALTER TABLE procurement_final_skus ADD COLUMN package_name TEXT');
-  } catch {
-    // Column already exists in initialized databases.
+  const columns = [
+    ['package_name', 'TEXT'],
+    ['current_with_pending_quantity', 'INTEGER DEFAULT 0'],
+    ['activity_start_estimated_quantity', 'INTEGER DEFAULT 0'],
+    ['june_ending_remaining_quantity', 'INTEGER DEFAULT 0'],
+    ['realtime_inventory_quantity', 'INTEGER DEFAULT 0'],
+  ];
+
+  for (const [name, type] of columns) {
+    try {
+      await db.execute(`ALTER TABLE procurement_final_skus ADD COLUMN ${name} ${type}`);
+    } catch {
+      // Column already exists in initialized databases.
+    }
   }
 }
 
@@ -58,7 +72,19 @@ export async function PUT(
     await ensureFinalSkuColumns();
     const { id: activityId } = await params;
     const body = await request.json();
-    const { skus = [] } = body;
+    const { skus = [], allowEmptySkus = false } = body;
+
+    if (!Array.isArray(skus)) {
+      return NextResponse.json({ error: 'skus 必须是数组' }, { status: 400 });
+    }
+
+    if (skus.length === 0 && !allowEmptySkus) {
+      return NextResponse.json({
+        success: true,
+        skipped: true,
+        message: 'SKU 为空，已跳过保存，避免误清空已保存的最终定稿 SKU 表',
+      });
+    }
 
     await db.execute({
       sql: 'DELETE FROM procurement_final_skus WHERE activity_id = ?',
@@ -81,10 +107,14 @@ export async function PUT(
             unit_cost,
             suggested_purchase_quantity,
             final_purchase_quantity,
+            current_with_pending_quantity,
+            activity_start_estimated_quantity,
+            june_ending_remaining_quantity,
+            realtime_inventory_quantity,
             status,
             remark,
             sort_order
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         args: [
           activityId,
@@ -98,7 +128,11 @@ export async function PUT(
           Number(sku.unitCost || 0),
           Number(sku.suggestedPurchaseQuantity || 0),
           Number(sku.finalPurchaseQuantity || 0),
-          sku.status || '待确认',
+          Number(sku.currentWithPendingQuantity || 0),
+          Number(sku.activityStartEstimatedQuantity || 0),
+          Number(sku.juneEndingRemainingQuantity || 0),
+          Number(sku.realtimeInventoryQuantity || 0),
+          sku.status || '无需处理',
           sku.remark || '',
           i,
         ],

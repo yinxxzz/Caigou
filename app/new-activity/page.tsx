@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import WorkArea from '@/components/layout/WorkArea';
 
 type PackageDraft = {
@@ -21,8 +21,21 @@ type SkuDraft = {
   unitCost: number;
   suggestedPurchaseQuantity: number;
   finalPurchaseQuantity: number;
-  status: '可采购' | '无法采购' | '已替换' | '待确认';
+  currentWithPendingQuantity?: number;
+  activityStartEstimatedQuantity?: number;
+  juneEndingRemainingQuantity?: number;
+  realtimeInventoryQuantity?: number;
+  status: '采购' | '借调' | '备货' | '无需处理';
   remark: string;
+};
+
+type ConsumptionSkuItem = {
+  goodsCode?: string;
+  goodsName?: string;
+  displayName?: string;
+  remainingEstimatedQuantity?: number;
+  availableQuantity?: number;
+  endingAvailableQuantity?: number;
 };
 
 type NextOrderForecastResult = {
@@ -78,12 +91,26 @@ type SavedActivityDetail = {
   } | null;
   purchaseAdviceText: string | null;
   riskSummary: string | null;
+  currentConsumptionSummary: string | null;
+  pendingInboundItemsText: string | null;
   skus: SkuDraft[];
 };
 
 const parseCostLimit = (value: string | null, fallback: number) => {
   const match = value?.match(/\d+/);
   return match ? Number(match[0]) : fallback;
+};
+
+const normalizeStatus = (status?: string): SkuDraft['status'] => {
+  if (status === '采购' || status === '借调' || status === '备货' || status === '无需处理') {
+    return status;
+  }
+
+  if (status === '可采购') {
+    return '采购';
+  }
+
+  return '无需处理';
 };
 
 const normalizeSkuDraft = (sku: Partial<SkuDraft>): SkuDraft => ({
@@ -97,7 +124,11 @@ const normalizeSkuDraft = (sku: Partial<SkuDraft>): SkuDraft => ({
   unitCost: Number(sku.unitCost || 0),
   suggestedPurchaseQuantity: Number(sku.suggestedPurchaseQuantity || 0),
   finalPurchaseQuantity: Number(sku.finalPurchaseQuantity || 0),
-  status: sku.status || '待确认',
+  currentWithPendingQuantity: Number(sku.currentWithPendingQuantity || 0),
+  activityStartEstimatedQuantity: Number(sku.activityStartEstimatedQuantity || 0),
+  juneEndingRemainingQuantity: Number(sku.juneEndingRemainingQuantity || 0),
+  realtimeInventoryQuantity: Number(sku.realtimeInventoryQuantity || 0),
+  status: normalizeStatus(sku.status),
   remark: sku.remark || '',
 });
 
@@ -125,6 +156,106 @@ const parsePendingInboundItems = (value: string): PendingInboundItem[] => {
     };
   });
 };
+
+const normalizeText = (value?: string) => (value || '').trim().toLowerCase();
+
+const normalizeGoodsCode = (value?: string) => (value || '').trim().toUpperCase();
+
+const extractJsonText = (value: string) => {
+  const text = value.trim();
+  if (!text) {
+    return '';
+  }
+
+  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch?.[1]) {
+    return fenceMatch[1].trim();
+  }
+
+  const objectStart = text.indexOf('{');
+  const arrayStart = text.indexOf('[');
+  const startCandidates = [objectStart, arrayStart].filter((index) => index >= 0);
+  const start = startCandidates.length > 0 ? Math.min(...startCandidates) : -1;
+  const end = Math.max(text.lastIndexOf('}'), text.lastIndexOf(']'));
+
+  if (start >= 0 && end > start) {
+    return text.slice(start, end + 1);
+  }
+
+  return text;
+};
+
+const parseConsumptionSummary = (value: string): ConsumptionSkuItem[] => {
+  const jsonText = extractJsonText(value);
+  if (!jsonText) {
+    return [];
+  }
+
+  const parsed = JSON.parse(jsonText) as unknown;
+  const items = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray((parsed as { skuItems?: unknown[] }).skuItems)
+      ? (parsed as { skuItems: unknown[] }).skuItems
+      : [];
+
+  return items.map((item) => {
+    const record = item as Partial<ConsumptionSkuItem>;
+    return {
+      goodsCode: record.goodsCode || '',
+      goodsName: record.goodsName || '',
+      displayName: record.displayName || '',
+      remainingEstimatedQuantity: Number(record.remainingEstimatedQuantity || 0),
+      availableQuantity: Number(record.availableQuantity || 0),
+      endingAvailableQuantity: Number(record.endingAvailableQuantity || 0),
+    };
+  });
+};
+
+const validateConsumptionSummaryText = (value: string) => {
+  if (!value.trim()) {
+    return { ok: true, message: '未填写本期消耗摘要，相关库存预扣按 0 处理' };
+  }
+
+  try {
+    const items = parseConsumptionSummary(value);
+    if (items.length === 0) {
+      return { ok: false, message: '未识别到 skuItems 数组，请粘贴本期消耗情况模块生成的完整 JSON' };
+    }
+
+    return { ok: true, message: `已识别 ${items.length} 个本期消耗 SKU` };
+  } catch {
+    return { ok: false, message: '本期消耗摘要不是合法 JSON，请检查括号、逗号和引号' };
+  }
+};
+
+const validatePendingInboundItemsText = (value: string) => {
+  if (!value.trim()) {
+    return { ok: true, message: '未填写未入库/在途商品，按空数组处理' };
+  }
+
+  try {
+    const items = parsePendingInboundItems(value);
+    const invalidIndex = items.findIndex((item) => !item.goodsCode && !item.goodsName);
+    if (invalidIndex >= 0) {
+      return { ok: false, message: `第 ${invalidIndex + 1} 条缺少 goodsCode 或 goodsName，无法匹配 SKU` };
+    }
+
+    return { ok: true, message: `已识别 ${items.length} 个未入库/在途商品` };
+  } catch {
+    return { ok: false, message: '未入库/在途商品不是合法 JSON 数组，请检查格式' };
+  }
+};
+
+const parseQuantityText = (value?: string) => {
+  if (!value) {
+    return 0;
+  }
+
+  const match = value.replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : 0;
+};
+
+const formatReadonlyQuantity = (value?: number) => Number(value || 0).toLocaleString();
 
 const toLocalDateString = (date: Date) => {
   const year = date.getFullYear();
@@ -194,6 +325,113 @@ export default function NewActivityPage() {
   const isNewActivity = activityId === null;
   const isPlanningActivity = isNewActivity || !formData.endDate || formData.endDate >= toLocalDateString(new Date());
   const [hasLoadedDraft, setHasLoadedDraft] = useState(false);
+  const consumptionValidation = useMemo(
+    () => validateConsumptionSummaryText(nextProcurement.currentConsumptionSummary),
+    [nextProcurement.currentConsumptionSummary],
+  );
+  const pendingInboundValidation = useMemo(
+    () => validatePendingInboundItemsText(nextProcurement.pendingInboundItemsText),
+    [nextProcurement.pendingInboundItemsText],
+  );
+  const consumptionItems = useMemo(() => {
+    try {
+      return parseConsumptionSummary(nextProcurement.currentConsumptionSummary);
+    } catch {
+      return [];
+    }
+  }, [nextProcurement.currentConsumptionSummary]);
+  const pendingInboundItems = useMemo(() => {
+    try {
+      return parsePendingInboundItems(nextProcurement.pendingInboundItemsText);
+    } catch {
+      return [];
+    }
+  }, [nextProcurement.pendingInboundItemsText]);
+  const consumptionByCode = useMemo(() => {
+    const map = new Map<string, ConsumptionSkuItem>();
+    consumptionItems.forEach((item) => {
+      const code = normalizeGoodsCode(item.goodsCode);
+      if (code) {
+        map.set(code, item);
+      }
+    });
+    return map;
+  }, [consumptionItems]);
+  const consumptionByName = useMemo(() => {
+    const map = new Map<string, ConsumptionSkuItem>();
+    consumptionItems.forEach((item) => {
+      [item.goodsName, item.displayName].forEach((name) => {
+        const key = normalizeText(name);
+        if (key) {
+          map.set(key, item);
+        }
+      });
+    });
+    return map;
+  }, [consumptionItems]);
+  const pendingInboundByCode = useMemo(() => {
+    const map = new Map<string, number>();
+    pendingInboundItems.forEach((item) => {
+      const code = normalizeGoodsCode(item.goodsCode);
+      if (code) {
+        map.set(code, (map.get(code) || 0) + Number(item.pendingQuantity || 0));
+      }
+    });
+    return map;
+  }, [pendingInboundItems]);
+  const pendingInboundByName = useMemo(() => {
+    const map = new Map<string, number>();
+    pendingInboundItems.forEach((item) => {
+      [item.goodsName, item.displayName].forEach((name) => {
+        const key = normalizeText(name);
+        if (key) {
+          map.set(key, (map.get(key) || 0) + Number(item.pendingQuantity || 0));
+        }
+      });
+    });
+    return map;
+  }, [pendingInboundItems]);
+  const skusWithCalculatedFields = useMemo(
+    () =>
+      skus.map((sku) => {
+        const code = normalizeGoodsCode(sku.goodsCode);
+        const consumptionSku =
+          consumptionByCode.get(code) ||
+          consumptionByName.get(normalizeText(sku.goodsName)) ||
+          consumptionByName.get(normalizeText(sku.displayName));
+        const pendingInbound =
+          pendingInboundByCode.get(code) ||
+          pendingInboundByName.get(normalizeText(sku.goodsName)) ||
+          pendingInboundByName.get(normalizeText(sku.displayName)) ||
+          0;
+        const realtimeInventory =
+          parseQuantityText(inventoryByGoodsCode[sku.goodsCode]) ||
+          Number(sku.realtimeInventoryQuantity || 0) ||
+          Number(consumptionSku?.availableQuantity || 0);
+        const remainingEstimatedConsumption = Number(consumptionSku?.remainingEstimatedQuantity || 0);
+        const currentWithPendingQuantity = realtimeInventory + pendingInbound;
+        const activityStartEstimatedQuantity =
+          realtimeInventory - remainingEstimatedConsumption + pendingInbound + Number(sku.finalPurchaseQuantity || 0);
+        const juneEndingRemainingQuantity =
+          activityStartEstimatedQuantity - Number(sku.suggestedPurchaseQuantity || 0);
+
+        return {
+          ...sku,
+          realtimeInventoryQuantity: realtimeInventory,
+          currentWithPendingQuantity,
+          activityStartEstimatedQuantity,
+          juneEndingRemainingQuantity,
+        };
+      }),
+    [
+      consumptionByCode,
+      consumptionByName,
+      inventoryByGoodsCode,
+      pendingInboundByCode,
+      pendingInboundByName,
+      skus,
+    ],
+  );
 
   useEffect(() => {
     let ignore = false;
@@ -327,7 +565,11 @@ export default function NewActivityPage() {
         unitCost: 0,
         suggestedPurchaseQuantity: 0,
         finalPurchaseQuantity: 0,
-        status: '待确认',
+        currentWithPendingQuantity: 0,
+        activityStartEstimatedQuantity: 0,
+        juneEndingRemainingQuantity: 0,
+        realtimeInventoryQuantity: 0,
+        status: '无需处理',
         remark: '',
       },
     ]);
@@ -356,6 +598,11 @@ export default function NewActivityPage() {
 
   const copyNextProcurementPack = async () => {
     try {
+      if (!consumptionValidation.ok || !pendingInboundValidation.ok) {
+        setMessage('下期采购测算数据包生成失败：请先修正本期消耗摘要或未入库/在途商品 JSON');
+        return;
+      }
+
       await copyText(
         JSON.stringify(buildNextProcurementPack(), null, 2),
         '下期采购测算数据包已复制，可以粘贴给 Cursor',
@@ -451,6 +698,8 @@ export default function NewActivityPage() {
     });
     setNextProcurement({
       ...nextProcurement,
+      currentConsumptionSummary: detail.currentConsumptionSummary || '',
+      pendingInboundItemsText: detail.pendingInboundItemsText || '',
       procurementAdviceText: detail.purchaseAdviceText || '',
       riskSummary: detail.riskSummary || '',
     });
@@ -680,6 +929,11 @@ export default function NewActivityPage() {
     setMessage('保存中...');
 
     try {
+      if (!consumptionValidation.ok || !pendingInboundValidation.ok) {
+        setMessage('保存失败：请先修正本期消耗摘要或未入库/在途商品 JSON');
+        return;
+      }
+
       await fetch('/api/db/init', { method: 'POST' });
 
       await fetch('/api/procurement/base-config', {
@@ -743,14 +997,18 @@ export default function NewActivityPage() {
         body: JSON.stringify({
           purchaseAdviceText: nextProcurement.procurementAdviceText,
           riskSummary: nextProcurement.riskSummary,
+          currentConsumptionSummary: nextProcurement.currentConsumptionSummary,
+          pendingInboundItemsText: nextProcurement.pendingInboundItemsText,
         }),
       });
 
-      await fetch(`/api/procurement/activities/${nextActivityId}/final-skus`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ skus }),
-      });
+      if (skusWithCalculatedFields.length > 0) {
+        await fetch(`/api/procurement/activities/${nextActivityId}/final-skus`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ skus: skusWithCalculatedFields }),
+        });
+      }
 
       setMessage(
         `已保存活动 #${nextActivityId}，礼包 ${packages.length} 个，定稿 SKU ${skus.length} 个${
@@ -1140,7 +1398,9 @@ export default function NewActivityPage() {
                 本期消耗摘要（从左侧“本期消耗情况”复制）
               </label>
               <textarea
-                className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                className={`w-full rounded-md border px-3 py-2 ${
+                  consumptionValidation.ok ? 'border-gray-300' : 'border-red-400 bg-red-50'
+                }`}
                 rows={5}
                 value={nextProcurement.currentConsumptionSummary}
                 onChange={(e) =>
@@ -1151,13 +1411,18 @@ export default function NewActivityPage() {
                 }
                 placeholder="粘贴本期消耗情况模块生成的摘要，用于下期采购测算预扣库存"
               />
+              <p className={`mt-1 text-xs ${consumptionValidation.ok ? 'text-gray-500' : 'text-red-600'}`}>
+                {consumptionValidation.message}
+              </p>
             </div>
             <div>
               <label className="block text-sm font-medium mb-2">
                 未入库/在途商品（手动粘贴，可选）
               </label>
               <textarea
-                className="w-full px-3 py-2 border border-gray-300 rounded-md"
+                className={`w-full rounded-md border px-3 py-2 ${
+                  pendingInboundValidation.ok ? 'border-gray-300' : 'border-red-400 bg-red-50'
+                }`}
                 rows={5}
                 value={nextProcurement.pendingInboundItemsText}
                 onChange={(e) =>
@@ -1168,8 +1433,8 @@ export default function NewActivityPage() {
                 }
                 placeholder={'粘贴 JSON 数组，例如：[{ "goodsCode": "SKU", "goodsName": "商品名", "pendingQuantity": 1000, "expectedArrivalDate": "2026-05-25", "remark": "已采购未入库" }]'}
               />
-              <p className="mt-1 text-xs text-gray-500">
-                这部分会作为下期可用量，Cursor 会避免重复采购；不填则按空数组处理。
+              <p className={`mt-1 text-xs ${pendingInboundValidation.ok ? 'text-gray-500' : 'text-red-600'}`}>
+                {pendingInboundValidation.message}
               </p>
             </div>
             <div className="rounded-md bg-gray-50 p-4 text-sm text-gray-600">
@@ -1239,8 +1504,12 @@ export default function NewActivityPage() {
                   <th className="px-4 py-2 text-left">供应链商品名称</th>
                   <th className="px-4 py-2 text-left">前台展示商品名</th>
                   <th className="px-4 py-2 text-left">价格</th>
-                  <th className="px-4 py-2 text-left">建议采购量</th>
-                  <th className="px-4 py-2 text-left">最终采购量</th>
+                  <th className="px-4 py-2 text-left">当前库存（含在途）</th>
+                  <th className="px-4 py-2 text-left">活动开始初始库存</th>
+                  <th className="px-4 py-2 text-left">6月预计消耗</th>
+                  <th className="px-4 py-2 text-left">补充量</th>
+                  <th className="px-4 py-2 text-left">是否补充</th>
+                  <th className="px-4 py-2 text-left">6月结束后剩余</th>
                   <th className="px-4 py-2 text-left">实时库存</th>
                   <th className="px-4 py-2 text-left">状态</th>
                   <th className="px-4 py-2 text-left">备注</th>
@@ -1250,12 +1519,12 @@ export default function NewActivityPage() {
               <tbody>
                 {skus.length === 0 ? (
                   <tr>
-                    <td colSpan={12} className="px-4 py-8 text-center text-gray-500">
+                    <td colSpan={16} className="px-4 py-8 text-center text-gray-500">
                       暂无 SKU 数据，请先完成下期采购测算后添加
                     </td>
                   </tr>
                 ) : (
-                  skus.map((sku, index) => (
+                  skusWithCalculatedFields.map((sku, index) => (
                     <tr key={index} className="border-b border-gray-100 align-top">
                       <td className="px-2 py-2">
                         <input
@@ -1306,6 +1575,16 @@ export default function NewActivityPage() {
                         />
                       </td>
                       <td className="px-2 py-2">
+                        <span className="inline-block min-w-28 rounded bg-gray-50 px-2 py-1 text-sm text-gray-700">
+                          {formatReadonlyQuantity(sku.currentWithPendingQuantity)}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2">
+                        <span className="inline-block min-w-28 rounded bg-gray-50 px-2 py-1 text-sm text-gray-700">
+                          {formatReadonlyQuantity(sku.activityStartEstimatedQuantity)}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2">
                         <input
                           type="number"
                           className="w-24 rounded border border-gray-300 px-2 py-1"
@@ -1324,6 +1603,22 @@ export default function NewActivityPage() {
                             updateSku(index, 'finalPurchaseQuantity', Number(e.target.value))
                           }
                         />
+                      </td>
+                      <td className="px-2 py-2">
+                        <span
+                          className={`inline-block min-w-14 rounded px-2 py-1 text-center text-sm font-medium ${
+                            Number(sku.finalPurchaseQuantity || 0) > 0
+                              ? 'bg-blue-50 text-blue-700'
+                              : 'bg-gray-50 text-gray-500'
+                          }`}
+                        >
+                          {Number(sku.finalPurchaseQuantity || 0) > 0 ? '是' : '否'}
+                        </span>
+                      </td>
+                      <td className="px-2 py-2">
+                        <span className="inline-block min-w-28 rounded bg-gray-50 px-2 py-1 text-sm text-gray-700">
+                          {formatReadonlyQuantity(sku.juneEndingRemainingQuantity)}
+                        </span>
                       </td>
                       <td className="px-2 py-2">
                         <div className="flex min-w-32 flex-col gap-1">
@@ -1346,10 +1641,10 @@ export default function NewActivityPage() {
                             updateSku(index, 'status', e.target.value as SkuDraft['status'])
                           }
                         >
-                          <option>待确认</option>
-                          <option>可采购</option>
-                          <option>无法采购</option>
-                          <option>已替换</option>
+                          <option>采购</option>
+                          <option>借调</option>
+                          <option>备货</option>
+                          <option>无需处理</option>
                         </select>
                       </td>
                       <td className="px-2 py-2">
